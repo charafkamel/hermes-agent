@@ -117,6 +117,28 @@ def test_reference_never_matches_drop_marker():
     assert recover._drop_marker_re.search(ref) is None
 
 
+def test_ambiguous_repeated_anchor_fails_open():
+    """Repeated single-line anchors can point at the wrong span, so recovery
+    should fail open instead of emitting a confidently wrong line reference."""
+    original = "\n".join(
+        [
+            "start",
+            "repeat",
+            "first hidden payload",
+            "repeat",
+            "second hidden payload",
+            "end",
+        ]
+    )
+    compressed = "\n".join(["start", "repeat", "[content dropped]", "end"])
+    rewritten, gaps, ok = recover.rewrite_placeholders(
+        ".compresr/cache/ambiguous", original, compressed
+    )
+    assert not ok
+    assert gaps == []
+    assert rewritten == original
+
+
 def test_hook_skips_small_output():
     c = ToolOutputCompressor()
     c.enabled, c.api_key = True, "cmp_test"
@@ -209,6 +231,58 @@ def test_hook_failopen_when_no_recovery_reference(monkeypatch):
         tool_name="grep", args={"pattern": "x"}, result=ORIGINAL, tool_call_id="tc5"
     )
     assert out is None
+
+
+def test_hook_failopen_on_ambiguous_recovery(monkeypatch):
+    """If recovery references would be ambiguous, the transform hook leaves the
+    original result in context instead of returning compressed text."""
+    from plugins.tool_output_compresr import cache
+
+    original = "\n".join(
+        [
+            "start",
+            "repeat",
+            "first hidden payload",
+            "repeat",
+            "second hidden payload",
+            "end",
+        ]
+    )
+    compressed = "\n".join(["start", "repeat", "[content dropped]", "end"])
+    c = ToolOutputCompressor()
+    c.enabled, c.api_key, c.min_tokens = True, "cmp_test", 1
+    monkeypatch.setattr(
+        cache,
+        "store_original",
+        lambda cid, content, task_id="default": cache.relative_cache_path(cid),
+    )
+    monkeypatch.setattr(
+        c._client,
+        "compress",
+        lambda **kw: (compressed, {"tokens_saved": 10}),
+    )
+
+    assert c.on_transform_tool_result(
+        tool_name="grep", args={"pattern": "repeat"}, result=original, tool_call_id="tc6"
+    ) is None
+
+
+def test_tool_output_api_key_is_env_only(monkeypatch, tmp_path):
+    monkeypatch.delenv("COMPRESR_API_KEY", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "compresr:\n"
+        "  api_key: cmp_from_config\n"
+        "  tool_output_enabled: true\n"
+        "  tool_output_min_tokens: 7\n",
+        encoding="utf-8",
+    )
+
+    c = ToolOutputCompressor()
+    assert c.api_key == ""
+    assert c.enabled is True
+    assert c.min_tokens == 7
+    assert not c.active
 
 
 if __name__ == "__main__":

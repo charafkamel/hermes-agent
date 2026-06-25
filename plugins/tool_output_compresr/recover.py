@@ -40,7 +40,8 @@ MAX_RECOVERABLE_LINE_CHARS = 2000
 # Hermes's read_file_tool(path, offset>=1, limit) contract exactly.
 #   [compresr: 5 lines omitted · .compresr/cache/a3f9 L40-44 · Read(offset=40,limit=5) or Grep to recover]
 ADDRESSABLE_REF_FORMAT = (
-    "[{count} lines omitted (Read offset={offset})]"
+    "[compresr: {count} lines omitted · {path} L{start}-{end} · "
+    "Read(offset={offset},limit={count}) or Grep to recover]"
 )
 
 # Strict, line-counted removal marker ("[N lines removed ...]"). Used only by
@@ -89,6 +90,11 @@ def _find_run(hay: List[str], seg: List[str], start: int) -> int:
         if hay[i : i + len(seg)] == seg:
             return i
     return -1
+
+
+def _line_occurrences(hay: List[str], value: str) -> int:
+    """Count candidate single-line anchors in the original text."""
+    return hay.count(value)
 
 
 def build_reference(cache_path: str, gap: Gap) -> str:
@@ -168,6 +174,14 @@ def _anchor_walk(
             continue
         n = normalize_line(cl)
         if n == "":
+            if build_out:
+                out_lines.append(cl)
+            continue
+        if _line_occurrences(o_norm, n) > 1:
+            # A repeated single-line anchor can point at the wrong original
+            # span. Mark the output as low-confidence so callers can fail open
+            # instead of emitting confidently wrong recovery references.
+            reordered = True
             if build_out:
                 out_lines.append(cl)
             continue
@@ -267,12 +281,16 @@ def rewrite_placeholders(
     then to whole-file references (ok=false) for degenerate/paraphrased output.
     Returns ``(rewritten, gaps, ok)``.
     """
-    out, gaps, anchored, _ = _anchor_walk(cache_path, original, compressed, True)
-    if anchored:
+    out, gaps, anchored, reordered = _anchor_walk(cache_path, original, compressed, True)
+    if anchored and not reordered:
         return out, gaps, True
+    if reordered:
+        return original, [], False
 
-    ag, aok, _ = align_placeholders(original, compressed)
-    if aok and ag:
+    ag, aok, reordered = align_placeholders(original, compressed)
+    if reordered:
+        return original, [], False
+    if aok and ag and not reordered:
         counter = {"i": 0}
 
         def _repl(_m: "re.Match[str]") -> str:
@@ -283,6 +301,9 @@ def rewrite_placeholders(
 
         rewritten = _placeholder_re.sub(_repl, compressed)
         return rewritten, ag, True
+
+    if _drop_marker_re.search(compressed) is None:
+        return original, [], False
 
     # Safe fallback: replace every drop marker (any format) with a whole-file ref.
     whole = build_reference(cache_path, _whole_file_gap(original))
