@@ -44,6 +44,14 @@ verbatim kept lines against the cached original (normalized, tolerant of ~6%
 whitespace drift), so it works for `[5 lines removed]`, `[54 tokens dropped]`,
 and even silent drops with no marker at all.
 
+## Data sent to Compresr
+
+When enabled, this plugin sends large tool outputs to the configured Compresr
+API endpoint before those outputs enter the conversation context. Those outputs
+can include file contents, command output, logs, and other data returned by
+Hermes tools. Do not enable per-turn tool-output compression unless that
+third-party processing is acceptable for your deployment.
+
 ## Relationship to `context_engine/compresr`
 
 This is the **per-turn** complement to the **compaction-time**
@@ -68,7 +76,7 @@ Or run `hermes setup` and choose **Compresr** for the compression engine.
 
 | env / `compresr:` key | default | meaning |
 |---|---|---|
-| `COMPRESR_API_KEY` / `api_key` | — | **required** `cmp_…` key |
+| `COMPRESR_API_KEY` | — | **required** `cmp_…` key, read from `.env` only |
 | `COMPRESR_BASE_URL` / `base_url` | `https://api.compresr.ai/api` | API base |
 | `COMPRESR_TOOL_OUTPUT_ENABLED` / `tool_output_enabled` | `false` | master switch |
 | `COMPRESR_TOOL_OUTPUT_MODEL` / `tool_output_model` | `toc_latte_v2` | model |

@@ -20,9 +20,10 @@ Activation (opt-in, off by default):
     # ~/.hermes/.env
     COMPRESR_API_KEY=cmp_...
 
-Config (env first, then a ``compresr:`` block in config.yaml):
+Config (env first for secrets, then a ``compresr:`` block in config.yaml for
+non-secret settings):
 
-    COMPRESR_API_KEY                    (required) cmp_... key
+    COMPRESR_API_KEY                    (required, .env only) cmp_... key
     COMPRESR_BASE_URL                   default https://api.compresr.ai/api
     COMPRESR_TOOL_OUTPUT_ENABLED        "1" to enable (or compresr.tool_output_enabled)
     COMPRESR_TOOL_OUTPUT_MODEL          default toc_latte_v2
@@ -94,7 +95,7 @@ class ToolOutputCompressor:
                 return cfg[cfg_key]
             return default
 
-        self.api_key = _opt("COMPRESR_API_KEY", "api_key", "")
+        self.api_key = os.environ.get("COMPRESR_API_KEY", "")
         self.base_url = str(
             _opt("COMPRESR_BASE_URL", "base_url", _DEFAULT_BASE_URL)
         ).rstrip("/")
@@ -150,7 +151,7 @@ class ToolOutputCompressor:
     def _cache_id(content: str) -> str:
         # Hash the CONTENT (not the tool_call_id) so two different outputs can
         # never collide onto one cache file; identical outputs safely dedupe.
-        return hashlib.sha1(content.encode("utf-8")).hexdigest()[:12]
+        return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
 
     # -- the hook ----------------------------------------------------------
 
