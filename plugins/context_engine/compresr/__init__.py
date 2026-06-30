@@ -55,6 +55,13 @@ from agent.context_compressor import (
 )
 from hermes_constants import get_hermes_home
 
+try:
+    # Shared, shipped savings store + the /compresr command. Imported under an
+    # alias because ``stats`` is a local variable for the API response below.
+    from plugins.tool_output_compresr import stats as _stats
+except Exception:  # pragma: no cover - degrade gracefully if sibling plugin absent
+    _stats = None
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_BASE_URL = "https://api.compresr.ai/api"
@@ -238,6 +245,8 @@ class CompresrContextEngine(ContextCompressor):
             compressed, stats = self._call_compresr(context, query)
         except Exception as e:
             self.compresr_errors += 1
+            if _stats is not None:
+                _stats.record_error("compaction")
             self._last_summary_error = f"compresr: {e}"
             # Mirror the base's failure behavior: brief cooldown to avoid
             # hammering a failing endpoint on every turn.
@@ -247,6 +256,8 @@ class CompresrContextEngine(ContextCompressor):
 
         if not compressed or not compressed.strip():
             self.compresr_errors += 1
+            if _stats is not None:
+                _stats.record_error("compaction")
             self._last_summary_error = "compresr: empty compressed_context"
             # Back off like the exception path, so a persistently-empty endpoint
             # isn't re-hit on every compaction.
@@ -256,6 +267,10 @@ class CompresrContextEngine(ContextCompressor):
         self.compresr_calls += 1
         self.compresr_tokens_saved += _as_int(stats.get("tokens_saved"))
         self.compresr_last_duration_ms = _as_int(stats.get("duration_ms"))
+        if _stats is not None:
+            _stats.record_compaction(
+                _as_int(stats.get("original_tokens")), _as_int(stats.get("tokens_saved"))
+            )
         logger.info(
             "compresr: %s %s tokens -> %s tokens (saved %s, %sms server)",
             self.compresr_model,
@@ -342,3 +357,7 @@ class CompresrContextEngine(ContextCompressor):
 def register(ctx: Any) -> None:
     """Plugin entry point — called by the context-engine loader."""
     ctx.register_context_engine(CompresrContextEngine())
+    # Expose /compresr even for compaction-only users (tool-output plugin may be
+    # disabled). The command registry de-dupes if both compresr plugins register.
+    if _stats is not None:
+        _stats.register_slash_command(ctx)

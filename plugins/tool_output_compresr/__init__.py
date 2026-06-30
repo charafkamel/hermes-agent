@@ -42,8 +42,10 @@ from typing import Any, Dict, Optional
 
 from hermes_constants import get_hermes_home
 
+from . import stats
 from .client import CompresrToolOutputClient, DEFAULT_TOOL_OUTPUT_MODEL
 from .compress import compress_tool_output, count_tokens
+from .recover import CACHE_DIR_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +128,7 @@ class ToolOutputCompressor:
         self.calls = 0
         self.errors = 0
         self.tokens_saved = 0
+        self.recoveries = 0
         self._cooldown_until = 0.0
 
     # -- helpers -----------------------------------------------------------
@@ -160,6 +163,16 @@ class ToolOutputCompressor:
         # never collide onto one cache file; identical outputs safely dedupe.
         return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
 
+    @staticmethod
+    def _is_recovery_read(args: Any) -> bool:
+        """True if this tool call reads a cached original back (a recovery) — i.e.
+        an arg points into the ``.compresr/cache`` dir a prior reference emitted."""
+        if isinstance(args, dict):
+            for v in args.values():
+                if isinstance(v, str) and CACHE_DIR_NAME in v:
+                    return True
+        return False
+
     # -- the hook ----------------------------------------------------------
 
     def on_transform_tool_result(
@@ -178,6 +191,13 @@ class ToolOutputCompressor:
         returns None so the model sees the original.
         """
         if not self.active or not isinstance(result, str):
+            return None
+        if self._is_recovery_read(args):
+            # The agent pulled a cached original back — compression had dropped
+            # something it later needed. Count it (surfaced in /compresr) and leave
+            # the recovered content untouched.
+            self.recoveries += 1
+            stats.record_recovery()
             return None
         if status and status not in ("", "ok", "success"):
             return None  # don't mangle error results
@@ -203,12 +223,14 @@ class ToolOutputCompressor:
             )
         except Exception as e:  # compress is already fail-open, but be defensive
             self.errors += 1
+            stats.record_error("tool_output")
             self._cooldown_until = now + 30.0
             logger.warning("tool_output_compresr: hook error (%s)", e)
             return None
 
         if info.get("error"):
             self.errors += 1
+            stats.record_error("tool_output")
             self._cooldown_until = now + 30.0
         if not info.get("called_api"):
             return None  # API failed → leave the original output unchanged
@@ -219,6 +241,7 @@ class ToolOutputCompressor:
         saved = max(0, info.get("base_tokens", 0) - info.get("out_tokens", 0))
         self.calls += 1
         self.tokens_saved += saved
+        stats.record_tool_output(info.get("base_tokens", 0), saved)
         logger.info(
             "tool_output_compresr: %s %d→%d tokens (saved %d, %d gaps, anchored=%s)",
             tool_name,
@@ -240,6 +263,7 @@ class ToolOutputCompressor:
             "calls": self.calls,
             "errors": self.errors,
             "tokens_saved": self.tokens_saved,
+            "recoveries": self.recoveries,
         }
 
 
@@ -247,6 +271,7 @@ def register(ctx: Any) -> None:
     """Plugin entry point — called by the Hermes plugin loader."""
     compressor = ToolOutputCompressor()
     ctx.register_hook("transform_tool_result", compressor.on_transform_tool_result)
+    stats.register_slash_command(ctx)
     if not compressor.api_key:
         logger.info(
             "tool_output_compresr: loaded but COMPRESR_API_KEY is unset — inactive."
