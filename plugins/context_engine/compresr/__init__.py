@@ -39,9 +39,12 @@ factor 1/f (0.2 keep -> 5x).
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
+import re
+import socket
 import time
 import urllib.error
 import urllib.request
@@ -62,11 +65,26 @@ _MAX_KEEP_FRACTION = 0.95
 _DEFAULT_KEEP_FRACTION = 0.2
 _MAX_NX = 200.0
 _SOURCE_TAG = "integration:hermes"
-# Compresr requires a non-empty query; sent when no recent user focus derivable.
+_MAX_RESPONSE_BYTES = 32 * 1024 * 1024
+_SECRET_CTL_RE = re.compile(r"[\r\n\x00]")
+_NUMERIC_ONLY_HOST_RE = re.compile(r"\A(?:0x[0-9a-fA-F]+|[0-9]+)\Z")
 _FALLBACK_QUERY = (
     "Preserve the key facts, decisions, file paths, commands, results, and open "
     "tasks needed to continue this work."
 )
+
+
+def _read_with_cap(resp: Any, cap: int) -> bytes:
+    """Bounded read tolerant of mocks whose read() takes no size arg."""
+    try:
+        raw = resp.read(cap + 1)
+    except TypeError:
+        raw = resp.read()
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8")
+    if len(raw) > cap:
+        raise RuntimeError(f"response exceeded {cap} bytes")
+    return raw
 
 
 def _as_int(v: Any, default: int = 0) -> int:
@@ -107,23 +125,79 @@ def _read_config_block(key: str = "compresr") -> Dict[str, Any]:
         return {}
 
 
-_BLOCKED_METADATA_HOSTS = frozenset({
-    "169.254.169.254",  # AWS / GCP / Azure IMDS
-    "fd00:ec2::254",  # AWS IMDSv2 IPv6
-    "100.100.100.200",  # Alibaba
-    "168.63.129.16",  # Azure wire-server
-    "metadata.google.internal",
-    "metadata.goog",
+_BLOCKED_METADATA_HOST_NAMES = frozenset({
+    "metadata.google.internal", "metadata.goog", "metadata",
 })
+_BLOCKED_NETWORKS = tuple(
+    ipaddress.ip_network(n) for n in (
+        "169.254.0.0/16", "fd00::/8", "fe80::/10",
+        "100.100.100.200/32", "168.63.129.16/32",
+        "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10",
+    )
+)
+_LOCALHOST_NAMES = frozenset({"localhost", "127.0.0.1", "::1", "[::1]"})
+
+
+def _sanitize_secret(raw: str, label: str) -> str:
+    """Strip whitespace and reject CR/LF/NUL — urllib would raise ValueError
+    with the raw key in the message. Return '' on rejection (never the value)."""
+    if not raw:
+        return ""
+    stripped = raw.strip()
+    if _SECRET_CTL_RE.search(stripped):
+        logger.error("compresr: %s contained CR/LF/NUL and was rejected", label)
+        return ""
+    return stripped
+
+
+def _resolve_host_ips(host: str) -> tuple:
+    if not host:
+        return ()
+    ips: list = []
+    try:
+        ip = ipaddress.ip_address(host)
+        mapped = getattr(ip, "ipv4_mapped", None)
+        ips.append(mapped if mapped is not None else ip)
+        return tuple(ips)
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except (socket.gaierror, socket.herror, UnicodeError, OSError):
+        return ()
+    for _, _, _, _, sockaddr in infos:
+        try:
+            ip = ipaddress.ip_address(sockaddr[0].split("%", 1)[0])
+        except ValueError:
+            continue
+        mapped = getattr(ip, "ipv4_mapped", None)
+        ips.append(mapped if mapped is not None else ip)
+    return tuple(ips)
+
+
+def _is_blocked_host(host: str) -> bool:
+    h = (host or "").rstrip(".").lower()
+    if h in _BLOCKED_METADATA_HOST_NAMES:
+        return True
+    for ip in _resolve_host_ips(h):
+        if any(ip in net for net in _BLOCKED_NETWORKS):
+            return True
+    return False
+
+
+def _safe_url_repr(parsed) -> str:
+    if parsed is None:
+        return "?"
+    try:
+        return f"{parsed.scheme or '?'}://{parsed.hostname or '?'}"
+    except Exception:
+        return "?"
 
 
 def _secure_base_url(url: str, default: str) -> str:
-    """Reject a non-HTTPS base_url (except localhost) so a stray config/env value
-    can't silently downgrade egress to cleartext or redirect the API key to an
-    attacker-controlled host. Also blocks cloud-metadata endpoints so a
-    misconfigured base_url can't exfiltrate the API key to IMDS. Falls back to
-    *default* with a warning."""
-    import ipaddress
+    """Reject non-HTTPS (except localhost), numeric-shorthand IPv4 literals,
+    cloud-metadata hosts, and any host resolving to a private/link-local net.
+    Log only scheme://host — the raw URL may carry userinfo credentials."""
     from urllib.parse import urlparse
 
     try:
@@ -131,27 +205,29 @@ def _secure_base_url(url: str, default: str) -> str:
     except Exception:
         parsed = None
     host = (parsed.hostname or "").lower() if parsed else ""
+    safe = _safe_url_repr(parsed)
 
-    def _is_metadata_host() -> bool:
-        if host in _BLOCKED_METADATA_HOSTS:
-            return True
-        try:
-            return str(ipaddress.ip_address(host)) in _BLOCKED_METADATA_HOSTS
-        except ValueError:
-            return False
-
-    if parsed and _is_metadata_host():
+    if parsed and host and _NUMERIC_ONLY_HOST_RE.match(host):
         logger.warning(
-            "compresr: refusing base_url %r (cloud-metadata host); using %s", url, default,
+            "compresr: refusing numeric-shorthand IPv4 hostname %s; using %s",
+            safe, default,
+        )
+        return default
+
+    if parsed and parsed.scheme in ("http", "https") and host in _LOCALHOST_NAMES:
+        return url
+
+    if parsed and _is_blocked_host(host):
+        logger.warning(
+            "compresr: refusing base_url %s (cloud-metadata or private host); using %s",
+            safe, default,
         )
         return default
     if parsed and parsed.scheme == "https":
         return url
-    if parsed and parsed.scheme == "http" and host in ("localhost", "127.0.0.1", "::1"):
-        return url
     logger.warning(
-        "compresr: ignoring insecure base_url %r (must be https://); using %s",
-        url, default,
+        "compresr: ignoring insecure base_url %s (must be https://); using %s",
+        safe, default,
     )
     return default
 
@@ -170,7 +246,9 @@ class CompresrContextEngine(ContextCompressor):
                 return cfg[cfg_key]
             return default
 
-        self.compresr_api_key = os.environ.get("COMPRESR_API_KEY", "")
+        self.compresr_api_key = _sanitize_secret(
+            os.environ.get("COMPRESR_API_KEY", ""), "COMPRESR_API_KEY"
+        )
         self.compresr_base_url = _secure_base_url(
             str(_opt("COMPRESR_BASE_URL", "base_url", _DEFAULT_BASE_URL)).rstrip("/"),
             _DEFAULT_BASE_URL,
@@ -337,6 +415,10 @@ class CompresrContextEngine(ContextCompressor):
         self.compresr_tokens_in += _as_int(stats.get("original_tokens"))
         self.compresr_tokens_saved += _as_int(stats.get("tokens_saved"))
         self.compresr_last_duration_ms = _as_int(stats.get("duration_ms"))
+        # Clear any prior failure back-off on success so a transient error
+        # doesn't leave stale cooldown state in the session DB forever.
+        self._summary_failure_cooldown_until = 0.0
+        self._last_summary_error = None
         logger.info(
             "compresr: %s %s tokens -> %s tokens (saved %s, %sms server)",
             self.compresr_model,
@@ -386,16 +468,22 @@ class CompresrContextEngine(ContextCompressor):
         )
         try:
             with urllib.request.urlopen(req, timeout=self.compresr_timeout) as resp:
-                raw = resp.read().decode("utf-8")
+                raw = _read_with_cap(resp, _MAX_RESPONSE_BYTES).decode("utf-8")
         except urllib.error.HTTPError as e:
             detail = ""
             try:
-                detail = e.read().decode("utf-8")[:300]
+                detail = _read_with_cap(e, 4096).decode("utf-8")[:300]
             except Exception:
                 pass
             raise RuntimeError(f"HTTP {e.code}: {detail or e.reason}") from e
         except urllib.error.URLError as e:
             raise RuntimeError(f"connection error: {e.reason}") from e
+        except ValueError:
+            # urllib raises ValueError containing the raw API key when a header
+            # value has CTL chars — swallow the chain so it never reaches logs.
+            raise RuntimeError(
+                "invalid request headers (check COMPRESR_API_KEY for stray whitespace/CRLF)"
+            ) from None
 
         try:
             parsed = json.loads(raw)
@@ -429,4 +517,14 @@ class CompresrContextEngine(ContextCompressor):
 
 def register(ctx: Any) -> None:
     """Plugin entry point — called by the context-engine loader."""
-    ctx.register_context_engine(CompresrContextEngine())
+    engine = CompresrContextEngine()
+    # Refuse to register when unavailable so the loader falls back to the
+    # built-in compressor instead of ending sessions in a provider-side
+    # context-limit error under abort_on_summary_failure=True.
+    if not engine.is_available():
+        logger.error(
+            "compresr: refusing to register — engine is not available "
+            "(COMPRESR_API_KEY missing). Falling back to built-in compressor."
+        )
+        return
+    ctx.register_context_engine(engine)

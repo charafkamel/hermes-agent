@@ -9,15 +9,28 @@ the recovery pointer. stdlib-only (urllib) to keep the plugin import-light.
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
 import urllib.request
 from typing import Any, Dict, Tuple
 
-# The tool-output endpoint only accepts toc_* models (latte_v2 → HTTP 422).
 DEFAULT_TOOL_OUTPUT_MODEL = "toc_latte_v2"
 
-# Max chars of a server error body to surface in the raised RuntimeError.
 _ERR_DETAIL_MAXLEN = 300
+_MAX_RESPONSE_BYTES = 32 * 1024 * 1024
+_SECRET_CTL_RE = re.compile(r"[\r\n\x00]")
+
+
+def _read_with_cap(resp: Any, cap: int) -> bytes:
+    try:
+        raw = resp.read(cap + 1)
+    except TypeError:
+        raw = resp.read()
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8")
+    if len(raw) > cap:
+        raise RuntimeError(f"response exceeded {cap} bytes")
+    return raw
 
 
 class CompresrToolOutputClient:
@@ -32,7 +45,10 @@ class CompresrToolOutputClient:
         timeout: int = 30,
         source: str = DEFAULT_SOURCE,
     ) -> None:
-        self.api_key = api_key
+        clean = (api_key or "").strip()
+        if _SECRET_CTL_RE.search(clean):
+            clean = ""
+        self.api_key = clean
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout = timeout
@@ -77,16 +93,20 @@ class CompresrToolOutputClient:
         )
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                raw = resp.read().decode("utf-8")
+                raw = _read_with_cap(resp, _MAX_RESPONSE_BYTES).decode("utf-8")
         except urllib.error.HTTPError as e:
             detail = ""
             try:
-                detail = e.read().decode("utf-8")[:_ERR_DETAIL_MAXLEN]
+                detail = _read_with_cap(e, 4096).decode("utf-8")[:_ERR_DETAIL_MAXLEN]
             except Exception:
                 pass
             raise RuntimeError(f"HTTP {e.code}: {detail or e.reason}") from e
         except urllib.error.URLError as e:
             raise RuntimeError(f"connection error: {e.reason}") from e
+        except ValueError:
+            raise RuntimeError(
+                "invalid request headers (check COMPRESR_API_KEY for stray whitespace/CRLF)"
+            ) from None
 
         try:
             parsed = json.loads(raw)

@@ -464,11 +464,14 @@ def test_store_original_write_failure_returns_none(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.setattr(cache, "_get_active_env", lambda task_id: None)
 
-    def _boom_wt(self, *a, **k):
-        raise OSError("disk full")
+    real_open = cache.os.open
 
-    # monkeypatch auto-restores after the test.
-    monkeypatch.setattr(cache.Path, "write_text", _boom_wt)
+    def _boom_open(path, *a, **k):
+        if "compresr" in str(path):
+            raise OSError("disk full")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(cache.os, "open", _boom_open)
     assert cache.store_original("wf", ORIGINAL, task_id="t") is None
 
 

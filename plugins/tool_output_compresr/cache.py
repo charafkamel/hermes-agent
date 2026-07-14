@@ -246,31 +246,47 @@ def store_original(
     """
     root = ensure_cache_root()
     cache_path = cache_file_path(cache_id)
+    # Atomic write via O_NOFOLLOW + os.replace: a symlink attack on the cache
+    # dir can't redirect writes, and a concurrent sibling opening cache_path
+    # sees either the full old or full new bytes — never a partial write.
+    tmp_path = cache_path.with_name(f".{cache_path.name}.{os.getpid()}.tmp")
     try:
-        cache_path.write_text(content, encoding="utf-8")
+        fd = os.open(
+            str(tmp_path),
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+            _FILE_MODE,
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
         try:
-            os.chmod(cache_path, _FILE_MODE)
+            os.chmod(tmp_path, _FILE_MODE)
         except OSError:
             pass
+        os.replace(str(tmp_path), str(cache_path))
     except Exception as e:
         logger.warning("tool_output_compresr: cache write failed for %s: %s", cache_path, e)
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         return None
 
-    if not _force_sync_visible_cache(cache_path, task_id):
-        return None
+    sync_ok = _force_sync_visible_cache(cache_path, task_id)
+    visible_path = _agent_visible_cache_path(cache_path, task_id) if sync_ok else None
 
-    visible_path = _agent_visible_cache_path(cache_path, task_id)
+    # Run the pruner unconditionally so a Singularity / non-visible backend
+    # can't grow the cache without bound. Don't unlink on visibility failure
+    # — a concurrent sibling with identical content may already hold this path.
+    try:
+        with _STORE_LOCK:
+            _prune_cache_dir(str(root), max(0, int(max_cache_mb)) * _MB, str(cache_path))
+    except Exception as e:  # pragma: no cover
+        logger.debug("tool_output_compresr: cache prune failed: %s", e)
+
     if visible_path is None:
-        # Content-addressed: don't unlink — a sibling may already hold this path.
         logger.warning(
             "tool_output_compresr: cache path not visible to the active backend: %s",
             cache_path,
         )
         return None
-
-    try:
-        with _STORE_LOCK:
-            _prune_cache_dir(str(root), max(0, int(max_cache_mb)) * _MB, str(cache_path))
-    except Exception as e:  # pragma: no cover - pruning must never break recovery
-        logger.debug("tool_output_compresr: cache prune failed: %s", e)
     return visible_path

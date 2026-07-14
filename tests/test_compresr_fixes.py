@@ -185,6 +185,7 @@ def test_f3_bad_context_engine_ratio_override_becomes_none(monkeypatch):
 def test_f3_register_still_succeeds_with_bad_env(monkeypatch):
     """The end goal of F3: a typo'd tunable must not silently disable the feature.
     Both plugins must still register their hook / engine."""
+    monkeypatch.setenv("COMPRESR_API_KEY", "cmp_test_key")
     monkeypatch.setenv("COMPRESR_TIMEOUT", "abc")
     monkeypatch.setenv("COMPRESR_TOOL_OUTPUT_TIMEOUT", "abc")
     hooks, engines = [], []
@@ -200,3 +201,214 @@ def test_f3_register_still_succeeds_with_bad_env(monkeypatch):
 
     assert "transform_tool_result" in hooks
     assert len(engines) == 1
+
+
+# F4 — CR/LF/NUL in COMPRESR_API_KEY: sanitize on read + swallow ValueError.
+def test_f4_crlf_in_api_key_is_rejected_context_engine(monkeypatch, caplog):
+    monkeypatch.setenv("COMPRESR_API_KEY", "cmp_secret\r\ninjected")
+    eng = CompresrContextEngine()
+    assert eng.compresr_api_key == ""
+    assert eng.is_available() is False
+    assert "cmp_secret" not in caplog.text
+
+
+def test_f4_crlf_in_api_key_is_rejected_tool_output(monkeypatch, caplog):
+    monkeypatch.setenv("COMPRESR_API_KEY", "cmp_secret\r\ninjected")
+    monkeypatch.setenv("COMPRESR_TOOL_OUTPUT_ENABLED", "1")
+    comp = ToolOutputCompressor()
+    assert comp.api_key == ""
+    assert comp.active is False
+    assert "cmp_secret" not in caplog.text
+
+
+# F5 — metadata / private-net blocklist covers IPv6-mapped, decimal/hex shorthand,
+# full 169.254/16, RFC1918, CGNAT, fd00::/8, trailing-dot FQDN. Log-safe URL.
+@pytest.mark.parametrize("bad_url", [
+    "https://169.254.169.254/",
+    "https://169.254.170.2/",
+    "https://169.254.169.253/",
+    "https://[::ffff:169.254.169.254]/",
+    "https://2852039166/",
+    "https://0xa9fea9fe/",
+    "https://10.0.0.1/",
+    "https://192.168.1.1/",
+    "https://100.64.0.1/",
+    "https://[fd00:ec2::254]/",
+    "https://metadata.google.internal/",
+    "https://metadata.google.internal./",
+])
+def test_f5_context_engine_rejects_all_metadata_and_private_hosts(monkeypatch, bad_url):
+    monkeypatch.setenv("COMPRESR_API_KEY", "cmp_test_key")
+    monkeypatch.setenv("COMPRESR_BASE_URL", bad_url)
+    eng = CompresrContextEngine()
+    assert eng.compresr_base_url == "https://api.compresr.ai/api", (
+        f"base_url {bad_url!r} was not rejected — became {eng.compresr_base_url!r}"
+    )
+
+
+@pytest.mark.parametrize("bad_url", [
+    "https://169.254.169.254/",
+    "https://[::ffff:169.254.169.254]/",
+    "https://2852039166/",
+    "https://10.0.0.1/",
+])
+def test_f5_tool_output_plugin_rejects_all_metadata_and_private_hosts(monkeypatch, bad_url):
+    monkeypatch.setenv("COMPRESR_API_KEY", "cmp_test_key")
+    monkeypatch.setenv("COMPRESR_TOOL_OUTPUT_ENABLED", "1")
+    monkeypatch.setenv("COMPRESR_BASE_URL", bad_url)
+    comp = ToolOutputCompressor()
+    assert comp.base_url == "https://api.compresr.ai/api", (
+        f"base_url {bad_url!r} was not rejected — became {comp.base_url!r}"
+    )
+
+
+def test_f5_localhost_and_valid_https_still_pass(monkeypatch):
+    monkeypatch.setenv("COMPRESR_API_KEY", "cmp_test_key")
+    monkeypatch.setenv("COMPRESR_BASE_URL", "http://localhost:8000/api")
+    eng = CompresrContextEngine()
+    assert eng.compresr_base_url == "http://localhost:8000/api"
+
+    monkeypatch.setenv("COMPRESR_BASE_URL", "https://api.compresr.ai/api")
+    eng = CompresrContextEngine()
+    assert eng.compresr_base_url == "https://api.compresr.ai/api"
+
+
+def test_f5_rejected_url_log_never_contains_userinfo(monkeypatch, caplog):
+    import logging
+    caplog.set_level(logging.WARNING)
+    monkeypatch.setenv("COMPRESR_API_KEY", "cmp_test_key")
+    monkeypatch.setenv(
+        "COMPRESR_BASE_URL", "https://user:cmp_secret_in_url@169.254.169.254/"
+    )
+    eng = CompresrContextEngine()
+    assert eng.compresr_base_url == "https://api.compresr.ai/api"
+    assert "cmp_secret_in_url" not in caplog.text
+    assert "user:cmp_secret_in_url" not in caplog.text
+
+
+# F6 — register() refuses when is_available()==False.
+def test_f6_register_refuses_when_api_key_missing(monkeypatch):
+    monkeypatch.delenv("COMPRESR_API_KEY", raising=False)
+    engines = []
+    ctx = type("Ctx", (), {
+        "register_context_engine": lambda self, e: engines.append(e),
+    })()
+    import plugins.context_engine.compresr as ce
+    ce.register(ctx)
+    assert engines == []
+
+
+def test_f6_register_succeeds_when_api_key_present(monkeypatch):
+    monkeypatch.setenv("COMPRESR_API_KEY", "cmp_test_key")
+    engines = []
+    ctx = type("Ctx", (), {
+        "register_context_engine": lambda self, e: engines.append(e),
+    })()
+    import plugins.context_engine.compresr as ce
+    ce.register(ctx)
+    assert len(engines) == 1
+    assert engines[0].is_available() is True
+
+
+# F7 — redact tool args (query) + outbound + cached content.
+def test_f7_tool_output_redacts_query_and_content(monkeypatch, tmp_path):
+    monkeypatch.setenv("COMPRESR_API_KEY", "cmp_test_key")
+    monkeypatch.setenv("COMPRESR_TOOL_OUTPUT_ENABLED", "1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("COMPRESR_TOOL_OUTPUT_MIN_TOKENS", "1")
+
+    comp = ToolOutputCompressor()
+    seen = {}
+
+    def fake_compress(query, content, tool_name, cache_id, client, task_id,
+                      max_cache_mb, target_ratio, cache_content=None):
+        seen["query"] = query
+        seen["content"] = content
+        seen["cache_content"] = cache_content
+        return "compressed body\n\n[compresr:recover] ...", {
+            "called_api": True, "shortened": True, "cache_path": "/tmp/x",
+            "base_tokens": 1000, "out_tokens": 100, "saved": 900,
+        }
+
+    monkeypatch.setattr(
+        "plugins.tool_output_compresr.compress_tool_output", fake_compress
+    )
+
+    secret_args = {"command": "curl -H 'Authorization: Bearer sk-live-SECRETVALUE' https://api.example.com"}
+    # Short lines only, to avoid _has_unrecoverable_long_line's fail-open gate.
+    secret_output = (
+        "AWS_SECRET_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE\n"
+        + "\n".join(f"line {i} of output body xxxxxxxxxxxx" for i in range(500))
+    )
+
+    comp.on_transform_tool_result(
+        tool_name="terminal", args=secret_args, result=secret_output, status="ok",
+    )
+
+    from agent.redact import redact_sensitive_text
+    assert seen["query"] == redact_sensitive_text(f"terminal: {secret_args['command']}"[:600])
+    assert seen["content"] == redact_sensitive_text(secret_output)
+
+
+# F8 — success clears prior failure back-off state.
+def test_f8_success_clears_prior_failure_cooldown(monkeypatch):
+    monkeypatch.setenv("COMPRESR_API_KEY", "cmp_test_key")
+    eng = CompresrContextEngine()
+    eng._summary_failure_cooldown_until = 1e-9
+    eng._last_summary_error = "compresr: prior transient error"
+
+    monkeypatch.setattr(
+        eng, "_call_compresr",
+        lambda ctx, q: ("compressed body", {"original_tokens": 1000, "tokens_saved": 800}),
+    )
+    monkeypatch.setattr(eng, "_serialize_for_summary", lambda turns: "some turns")
+    out = eng._generate_summary([{"role": "user", "content": "x"}], focus_topic="topic")
+    assert out is not None
+    assert eng._summary_failure_cooldown_until == 0.0
+    assert eng._last_summary_error is None
+
+
+# F9 — atomic cache write via O_NOFOLLOW + os.replace; concurrent-write safe.
+def test_f9_store_original_uses_atomic_replace(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(cache, "_get_active_env", lambda task_id: None)
+
+    replaced = []
+    real_replace = cache.os.replace
+
+    def _spy_replace(src, dst):
+        replaced.append((str(src), str(dst)))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(cache.os, "replace", _spy_replace)
+    content = "atomic body\n" * 200
+    cache.store_original("atomic1", content, task_id="t", max_cache_mb=0)
+
+    assert len(replaced) == 1
+    src, dst = replaced[0]
+    assert ".atomic1." in os.path.basename(src) and src.endswith(".tmp")
+    assert dst.endswith("/atomic1")
+
+    final_path = tmp_path / "cache" / "compresr" / "tool-output" / "atomic1"
+    assert final_path.read_text() == content
+
+
+def test_f9_concurrent_writes_never_produce_partial_content(monkeypatch, tmp_path):
+    import threading
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(cache, "_get_active_env", lambda task_id: None)
+
+    content_a = "AAAA" * 5000
+    content_b = "BBBB" * 5000
+
+    def writer(cid, content, n):
+        for _ in range(n):
+            cache.store_original(cid, content, task_id="t", max_cache_mb=0)
+
+    ta = threading.Thread(target=writer, args=("cw", content_a, 30))
+    tb = threading.Thread(target=writer, args=("cw", content_b, 30))
+    ta.start(); tb.start(); ta.join(); tb.join()
+
+    final = (tmp_path / "cache" / "compresr" / "tool-output" / "cw").read_text()
+    assert final == content_a or final == content_b
+    assert len(final) == len(content_a)
