@@ -41,10 +41,12 @@ non-secret settings):
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import logging
 import os
 import re
+import socket
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
@@ -55,7 +57,26 @@ from . import cache
 from .client import CompresrToolOutputClient, DEFAULT_TOOL_OUTPUT_MODEL
 from .compress import FOOTER_MARKER, compress_tool_output, count_tokens
 
+try:
+    from agent.redact import redact_sensitive_text as _redact
+except Exception:
+    def _redact(s: str) -> str:  # type: ignore[misc]
+        return s
+
 logger = logging.getLogger(__name__)
+
+_SECRET_CTL_RE = re.compile(r"[\r\n\x00]")
+_NUMERIC_ONLY_HOST_RE = re.compile(r"\A(?:0x[0-9a-fA-F]+|[0-9]+)\Z")
+
+
+def _sanitize_secret(raw: str, label: str) -> str:
+    if not raw:
+        return ""
+    stripped = raw.strip()
+    if _SECRET_CTL_RE.search(stripped):
+        logger.error("tool_output_compresr: %s contained CR/LF/NUL and was rejected", label)
+        return ""
+    return stripped
 
 _DEFAULT_BASE_URL = "https://api.compresr.ai/api"
 _DEFAULT_MIN_TOKENS = 1500
@@ -75,21 +96,64 @@ _QUERY_ARG_KEYS = ("query", "pattern", "command", "q", "search", "regex", "url")
 _PATH_ARG_KEYS = ("file_path", "path", "file", "filename", "directory")
 
 
-_BLOCKED_METADATA_HOSTS = frozenset({
-    "169.254.169.254",
-    "fd00:ec2::254",
-    "100.100.100.200",
-    "168.63.129.16",
-    "metadata.google.internal",
-    "metadata.goog",
+_BLOCKED_METADATA_HOST_NAMES = frozenset({
+    "metadata.google.internal", "metadata.goog", "metadata",
 })
+_BLOCKED_NETWORKS = tuple(
+    ipaddress.ip_network(n) for n in (
+        "169.254.0.0/16", "fd00::/8", "fe80::/10",
+        "100.100.100.200/32", "168.63.129.16/32",
+        "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10",
+    )
+)
+_LOCALHOST_NAMES = frozenset({"localhost", "127.0.0.1", "::1", "[::1]"})
+
+
+def _resolve_host_ips(host: str) -> tuple:
+    if not host:
+        return ()
+    ips: list = []
+    try:
+        ip = ipaddress.ip_address(host)
+        mapped = getattr(ip, "ipv4_mapped", None)
+        ips.append(mapped if mapped is not None else ip)
+        return tuple(ips)
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except (socket.gaierror, socket.herror, UnicodeError, OSError):
+        return ()
+    for _, _, _, _, sockaddr in infos:
+        try:
+            ip = ipaddress.ip_address(sockaddr[0].split("%", 1)[0])
+        except ValueError:
+            continue
+        mapped = getattr(ip, "ipv4_mapped", None)
+        ips.append(mapped if mapped is not None else ip)
+    return tuple(ips)
+
+
+def _is_blocked_host(host: str) -> bool:
+    h = (host or "").rstrip(".").lower()
+    if h in _BLOCKED_METADATA_HOST_NAMES:
+        return True
+    for ip in _resolve_host_ips(h):
+        if any(ip in net for net in _BLOCKED_NETWORKS):
+            return True
+    return False
+
+
+def _safe_url_repr(parsed) -> str:
+    if parsed is None:
+        return "?"
+    try:
+        return f"{parsed.scheme or '?'}://{parsed.hostname or '?'}"
+    except Exception:
+        return "?"
 
 
 def _secure_base_url(url: str, default: str) -> str:
-    """Reject a non-HTTPS base_url (except localhost) and cloud-metadata hosts so
-    a stray config/env value can't downgrade egress to cleartext or exfiltrate
-    the API key to IMDS. Falls back to *default* with a warning."""
-    import ipaddress
     from urllib.parse import urlparse
 
     try:
@@ -97,27 +161,29 @@ def _secure_base_url(url: str, default: str) -> str:
     except Exception:
         parsed = None
     host = (parsed.hostname or "").lower() if parsed else ""
+    safe = _safe_url_repr(parsed)
 
-    def _is_metadata_host() -> bool:
-        if host in _BLOCKED_METADATA_HOSTS:
-            return True
-        try:
-            return str(ipaddress.ip_address(host)) in _BLOCKED_METADATA_HOSTS
-        except ValueError:
-            return False
-
-    if parsed and _is_metadata_host():
+    if parsed and host and _NUMERIC_ONLY_HOST_RE.match(host):
         logger.warning(
-            "tool_output_compresr: refusing base_url %r (cloud-metadata host); using %s", url, default,
+            "tool_output_compresr: refusing numeric-shorthand IPv4 hostname %s; using %s",
+            safe, default,
+        )
+        return default
+
+    if parsed and parsed.scheme in ("http", "https") and host in _LOCALHOST_NAMES:
+        return url
+
+    if parsed and _is_blocked_host(host):
+        logger.warning(
+            "tool_output_compresr: refusing base_url %s (cloud-metadata or private host); using %s",
+            safe, default,
         )
         return default
     if parsed and parsed.scheme == "https":
         return url
-    if parsed and parsed.scheme == "http" and host in ("localhost", "127.0.0.1", "::1"):
-        return url
     logger.warning(
-        "tool_output_compresr: ignoring insecure base_url %r (must be https://); using %s",
-        url, default,
+        "tool_output_compresr: ignoring insecure base_url %s (must be https://); using %s",
+        safe, default,
     )
     return default
 
@@ -251,7 +317,9 @@ class ToolOutputCompressor:
                 return cfg[cfg_key]
             return default
 
-        self.api_key = os.environ.get("COMPRESR_API_KEY", "")
+        self.api_key = _sanitize_secret(
+            os.environ.get("COMPRESR_API_KEY", ""), "COMPRESR_API_KEY"
+        )
         self.base_url = _secure_base_url(
             str(_opt("COMPRESR_BASE_URL", "base_url", _DEFAULT_BASE_URL)).rstrip("/"),
             _DEFAULT_BASE_URL,
@@ -402,16 +470,15 @@ class ToolOutputCompressor:
         if now < self._cooldown_until:
             return None
 
-        query = self._derive_query(tool_name, args)
+        # Redact secrets in tool args (curl -H 'Authorization: Bearer ...' etc)
+        # before the query string leaves the process to a third-party API.
+        query = _redact(self._derive_query(tool_name, args))
 
         inner_text, splice = _try_unwrap_json_tool_result(tool_name, result)
         compress_target = inner_text if inner_text is not None else result
         if inner_text is not None and count_tokens(inner_text) < self.min_tokens:
             return None
 
-        # For already-numbered payloads (read_file), cache a de-numbered copy so
-        # a recovery read_file re-adds exactly one clean gutter instead of a
-        # doubled "M|N|" prefix. The API + size gate still see compress_target.
         cache_content = compress_target
         if (
             inner_text is not None
@@ -420,12 +487,14 @@ class ToolOutputCompressor:
         ):
             cache_content = _strip_line_gutter(inner_text)
 
-        # The recovery tools (read_file/search_files) clamp any line longer than
-        # get_max_line_length() and give the agent no offset to reach the tail,
-        # so a cached original with such a line can't be recovered byte-exact.
-        # Fail open rather than hand out a lossy recovery pointer.
         if _has_unrecoverable_long_line(cache_content):
             return None
+
+        # Redact outbound + cached content. The cache is a durable secret-bearing
+        # artefact on disk; content-address AFTER redaction so identical
+        # redacted content dedupes.
+        compress_target = _redact(compress_target)
+        cache_content = _redact(cache_content)
 
         cache_id = self._cache_id(compress_target)
         try:
