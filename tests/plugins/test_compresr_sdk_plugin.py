@@ -107,6 +107,55 @@ def test_shim_fails_open_without_sdk(isolated_cache_dirs, hermes_home, monkeypat
     assert any(new == "cache/compresr/tool-output" for new, _ in cf._CACHE_DIRS)
 
 
+def test_missing_sdk_warns_on_the_console(isolated_cache_dirs, hermes_home, monkeypatch):
+    """The install hint must reach the user, not just the log file — Hermes
+    routes logging to files, so a log-only hint is an invisible hint."""
+    for name in list(sys.modules):
+        if name == "compresr" or name.startswith("compresr."):
+            monkeypatch.delitem(sys.modules, name, raising=False)
+    monkeypatch.setattr(
+        "builtins.__import__",
+        _blocking_import("compresr", real=__import__),
+    )
+    shim = _load_shim()
+    seen = []
+    monkeypatch.setattr(shim, "_emit_console_warning", seen.append)
+    shim.register(object())
+    assert len(seen) == 1
+    assert "pip install compresr" in seen[0]
+
+
+def test_console_warning_survives_a_closed_stderr():
+    """A daemonised parent may close fd 2. Writing into a dead stream leaves
+    CPython unable to flush at shutdown (exit 120), so a warning must not
+    change the process exit code."""
+    import subprocess
+
+    shim_path = _load_shim().__file__
+    code = (
+        "import importlib.util as u, os; os.close(2); "
+        f"s=u.spec_from_file_location('shim', {shim_path!r}); "
+        "m=u.module_from_spec(s); s.loader.exec_module(m); "
+        "m._emit_console_warning('sdk missing'); print('ok')"
+    )
+    p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert p.returncode == 0
+    assert "ok" in p.stdout
+
+
+def test_console_warning_reaches_headless_stderr(monkeypatch, capsys):
+    """No hermes_cli helper and no TTY (systemd/cron/gateway): still on stderr."""
+    shim = _load_shim()
+    # Both entries: a cached submodule still resolves even if the package is None.
+    monkeypatch.setitem(sys.modules, "hermes_cli", None)
+    monkeypatch.setitem(sys.modules, "hermes_cli.cli_output", None)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: False, raising=False)
+    shim._emit_console_warning("sdk is missing")
+    err = capsys.readouterr().err
+    assert "⚠ sdk is missing" in err
+    assert "\033[" not in err
+
+
 def _blocking_import(blocked_prefix, real):
     def _imp(name, *args, **kwargs):
         if name == blocked_prefix or name.startswith(blocked_prefix + "."):
