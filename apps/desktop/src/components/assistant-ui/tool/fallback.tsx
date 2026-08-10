@@ -53,6 +53,7 @@ import {
   cleanVisibleText,
   countDiffLineStats,
   inlineDiffFromResult,
+  isCardTool,
   isFileEditTool,
   isPreviewableTarget,
   looksRedundant,
@@ -214,11 +215,14 @@ function ToolGlyph({
   copy,
   filePath,
   icon,
+  legendary,
   status
 }: {
   copy: ToolStatusCopy
   filePath?: string
   icon?: string
+  /** Landed memory write — keep the brain glyph, tint it gold→purple. */
+  legendary?: boolean
   status?: ToolStatus
 }) {
   const node = status ? (
@@ -226,10 +230,16 @@ function ToolGlyph({
   ) : filePath ? (
     <FileTypeIcon className="text-(--ui-text-tertiary)" path={filePath} size="0.875rem" />
   ) : icon ? (
-    <ToolIcon className="text-(--ui-text-tertiary)" name={icon} size="0.875rem" />
+    <ToolIcon
+      className={legendary ? 'text-(--tool-memory-legendary-icon)' : 'text-(--ui-text-tertiary)'}
+      name={icon}
+      size="0.875rem"
+    />
   ) : null
 
-  return node ? <span className={TOOL_HEADER_GLYPH_WRAP_CLASS}>{node}</span> : null
+  return node ? (
+    <span className={cn(TOOL_HEADER_GLYPH_WRAP_CLASS, legendary && 'tool-memory-legendary-glyph')}>{node}</span>
+  ) : null
 }
 
 // Which status (if any) should pre-empt the tool's icon in the leading
@@ -275,11 +285,13 @@ function LinkifiedText({ className, text }: { className?: string; text: string }
 
 function ToolTitle({
   isPending,
+  legendary,
   status,
   title,
   titleAction
 }: {
   isPending: boolean
+  legendary?: boolean
   status: ToolStatus
   title: string
   titleAction?: ToolTitleAction
@@ -290,7 +302,8 @@ function ToolTitle({
         SCAFFOLD_LABEL_CLASS,
         isPending && 'text-(--conversation-scaffold-meta)',
         status === 'error' && 'text-destructive',
-        status === 'warning' && 'text-amber-700 dark:text-amber-300'
+        status === 'warning' && 'text-amber-700 dark:text-amber-300',
+        legendary && !isPending && 'tool-memory-legendary-title text-transparent'
       )}
     >
       {isPending && titleAction ? (
@@ -466,6 +479,10 @@ function ToolEntry({ part }: ToolEntryProps) {
 
   const showDiffStats = !isPending && Boolean(diffStats && (diffStats.added > 0 || diffStats.removed > 0))
 
+  // Landed memory write gets gold→purple chrome instead of the plain scaffold grey.
+  const memoryLegendary = !isPending && part.toolName === 'memory' && view.status === 'success'
+  const memoryMetaClass = memoryLegendary ? 'tool-memory-legendary-meta' : undefined
+
   // The header trailing slot only carries the live duration timer while the
   // tool is running. The copy control used to live here too, but an
   // `opacity-0` (yet still clickable) button straddling the caret/duration made
@@ -542,10 +559,19 @@ function ToolEntry({ part }: ToolEntryProps) {
               copy={copy}
               filePath={isFileEdit ? view.subtitle : undefined}
               icon={view.icon}
+              legendary={memoryLegendary}
               status={leadingStatus(isPending, view.status)}
             />
-            <ToolTitle isPending={isPending} status={view.status} title={view.title} titleAction={view.titleAction} />
-            {!isPending && view.countLabel && <span className={SCAFFOLD_META_CLASS}>{view.countLabel}</span>}
+            <ToolTitle
+              isPending={isPending}
+              legendary={memoryLegendary}
+              status={view.status}
+              title={view.title}
+              titleAction={view.titleAction}
+            />
+            {!isPending && view.countLabel && (
+              <span className={cn(SCAFFOLD_META_CLASS, memoryMetaClass)}>{view.countLabel}</span>
+            )}
             {showDiffStats && diffStats && (
               <span className="flex shrink-0 items-center gap-1 font-mono text-[0.625rem] tabular-nums">
                 {diffStats.added > 0 && (
@@ -557,7 +583,7 @@ function ToolEntry({ part }: ToolEntryProps) {
               </span>
             )}
             {!isFileEdit && !isPending && view.durationLabel && (
-              <span className={SCAFFOLD_META_CLASS}>{view.durationLabel}</span>
+              <span className={cn(SCAFFOLD_META_CLASS, memoryMetaClass)}>{view.durationLabel}</span>
             )}
           </span>
         </DisclosureRow>
@@ -713,22 +739,9 @@ function TerminalTranscript({ command, exitCode }: TerminalTranscriptProps) {
 }
 
 // Tools that draw their own surface and must never be folded into a run's
-// summary. Two kinds, for the same reason — the thing on screen IS the point:
-//
-//   - File edits are the deliverable, not scaffolding. The diff is what the
-//     user reviews, so it stays visible at its place in the turn, live and
-//     settled, the way a PR shows its changes.
-//   - `clarify`, `image_generate` and `delegate_task` bypass ToolEntry to
-//     render their own markup: a question the user has to answer, an image
-//     they asked for, the several agents a fan-out is running.
-//
-// Everything else is ephemeral activity — reads, searches, commands — which is
-// what a run summarizes and what the live ticker cycles through.
-const CARD_TOOLS = new Set(['clarify', 'delegate_task', 'image_generate'])
-
-export function isCardTool(toolName: string): boolean {
-  return CARD_TOOLS.has(toolName) || isFileEditTool(toolName)
-}
+// summary live in `fallback-model` (`isCardTool`) — the DOM render budget
+// prices a turn by the same rule, so both sides have to agree on which rows
+// collapse into a summary line and which mount their own markup.
 
 export type RunItem = { end: number; kind: 'run'; start: number } | { index: number; kind: 'card' }
 

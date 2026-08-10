@@ -210,9 +210,35 @@ def test_prompt_requires_env_for_key_forwards_resolved_env(monkeypatch):
     monkeypatch.setattr(
         pc, "_prompt_plugin_env_vars", lambda manifest, console: seen.update(manifest)
     )
+    monkeypatch.setattr(pc.sys.stdin, "isatty", lambda: True)
     pc._prompt_requires_env_for_key("compresr", console=None)
     assert seen.get("name") == "compresr"
     assert seen.get("requires_env") == [{"name": "COMPRESR_API_KEY", "secret": True}]
+
+
+def test_prompt_requires_env_for_key_non_tty_hints_instead_of_prompting(monkeypatch):
+    """Scripted enable (no TTY) prints a .env hint and never opens a prompt."""
+    from unittest.mock import MagicMock
+
+    monkeypatch.setattr(
+        pc,
+        "_discover_all_plugins",
+        lambda: [("compresr", "1", "d", "entrypoint", "fake_ep3", "compresr")],
+    )
+    mod = types.ModuleType("fake_ep3")
+    mod.REQUIRES_ENV = [{"name": "COMPRESR_API_KEY", "secret": True}]
+    monkeypatch.setitem(sys.modules, "fake_ep3", mod)
+    prompted = []
+    monkeypatch.setattr(
+        pc, "_prompt_plugin_env_vars", lambda manifest, console: prompted.append(manifest)
+    )
+    monkeypatch.setattr(pc.sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr("hermes_cli.config.get_env_value", lambda name: None)
+    console = MagicMock()
+    pc._prompt_requires_env_for_key("compresr", console=console)
+    assert not prompted
+    hint = " ".join(str(c) for c in console.print.call_args_list)
+    assert "COMPRESR_API_KEY" in hint
 
 
 def test_prompt_requires_env_for_key_no_env_no_prompt(monkeypatch):
