@@ -160,6 +160,11 @@ def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] 
         }
         if failure is not None:
             report["failure"] = failure
+        from hermes_cli.compresr_usage import collect_compresr_usage
+
+        compresr = result.get("compresr") or collect_compresr_usage()
+        if compresr:
+            report["compresr"] = compresr
         out = Path(path).expanduser()
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
@@ -464,6 +469,19 @@ def _run_agent(
         agent.tool_gen_callback = None
 
         result = agent.run_conversation(prompt)
+        # Snapshot while the agent is alive: the per-agent context engine is a
+        # deep copy of the plugin singleton, so its counters are only reachable
+        # here (see agent_init.py's register_context_engine copy).
+        try:
+            from hermes_cli.compresr_usage import collect_compresr_usage
+
+            compresr = collect_compresr_usage(
+                getattr(agent, "context_compressor", None)
+            )
+            if compresr and isinstance(result, dict):
+                result["compresr"] = compresr
+        except Exception:
+            pass
         return (result.get("final_response") or "", result)
     finally:
         # Ordering deliberately mirrors gateway/run.py:_cleanup_agent_resources,
