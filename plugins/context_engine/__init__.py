@@ -34,8 +34,8 @@ def discover_context_engines() -> List[Tuple[str, str, bool]]:
     """Scan plugins/context_engine/ for available engines.
 
     Returns list of (name, description, is_available) tuples.
-    Does NOT import the engines — just reads plugin.yaml for metadata
-    and does a lightweight availability check.
+    Imports each engine module to collect its commands and availability;
+    a failing engine is skipped, not fatal.
     """
     results = []
     if not _CONTEXT_ENGINE_PLUGINS_DIR.is_dir():

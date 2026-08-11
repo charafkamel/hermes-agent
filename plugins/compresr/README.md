@@ -17,7 +17,7 @@ shim that:
 
 ```bash
 # 1. Install the SDK into the interpreter that runs Hermes:
-pip install 'compresr>=2.8.4'          # or: compresr-sdk login   (writes the key)
+pip install 'compresr>=2.10.0'         # or: compresr-sdk login   (writes the key)
 
 # 2. Set the key (if not using `compresr-sdk login`):
 echo 'COMPRESR_API_KEY=cmp_...' >> ~/.hermes/.env

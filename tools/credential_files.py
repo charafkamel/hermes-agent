@@ -416,12 +416,21 @@ def register_cache_dir(new_subpath: str, old_name: Optional[str] = None) -> None
     unreadable on Docker/Modal/SSH. Idempotent. ``old_name`` is an optional
     legacy dir name (defaults to ``new_subpath``).
     """
+    from tools.path_security import has_traversal_component
+
     subpath = (new_subpath or "").strip().strip("/")
     if not subpath:
         raise ValueError("register_cache_dir: new_subpath must be non-empty")
+    legacy = old_name.strip().strip("/") if old_name else subpath
+    # Keep the mount inside HERMES_HOME: reject ``..`` traversal in EITHER the
+    # subpath or the legacy name — both flow into a ``home / <name>`` join
+    # (get_hermes_dir) that does no containment check of its own.
+    for candidate in (subpath, legacy):
+        if has_traversal_component(candidate):
+            raise ValueError(f"register_cache_dir: unsafe path {candidate!r}")
     if any(existing == subpath for existing, _ in _CACHE_DIRS):
         return
-    _CACHE_DIRS.append((subpath, old_name.strip().strip("/") if old_name else subpath))
+    _CACHE_DIRS.append((subpath, legacy))
 
 
 def get_cache_directory_mounts(
