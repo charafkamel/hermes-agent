@@ -422,9 +422,7 @@ def register_cache_dir(new_subpath: str, old_name: Optional[str] = None) -> None
     if not subpath:
         raise ValueError("register_cache_dir: new_subpath must be non-empty")
     legacy = old_name.strip().strip("/") if old_name else subpath
-    # Keep the mount inside HERMES_HOME: reject ``..`` traversal in EITHER the
-    # subpath or the legacy name — both flow into a ``home / <name>`` join
-    # (get_hermes_dir) that does no containment check of its own.
+    # Both names feed an unchecked ``home / <name>`` join (get_hermes_dir).
     for candidate in (subpath, legacy):
         if has_traversal_component(candidate):
             raise ValueError(f"register_cache_dir: unsafe path {candidate!r}")
