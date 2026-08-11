@@ -163,7 +163,7 @@ class FileSyncManager:
         self._last_sync_time: float = 0.0  # monotonic; 0 ensures first sync runs
         self._sync_interval = sync_interval
 
-    def sync(self, *, force: bool = False) -> None:
+    def sync(self, *, force: bool = False, raise_on_error: bool = False) -> None:
         """Run a sync cycle: upload changed files, delete removed files.
 
         Rate-limited to once per ``sync_interval`` unless *force* is True
@@ -171,11 +171,15 @@ class FileSyncManager:
 
         Transactional: state only committed if ALL operations succeed.
         On failure, state rolls back so the next cycle retries everything.
+
+        Failures are logged and swallowed by default (best-effort background
+        sync); ``raise_on_error=True`` re-raises after rollback for callers
+        that must know the upload landed.
         """
         with self._transaction_lock:
-            self._sync_transaction(force=force)
+            self._sync_transaction(force=force, raise_on_error=raise_on_error)
 
-    def _sync_transaction(self, *, force: bool = False) -> None:
+    def _sync_transaction(self, *, force: bool = False, raise_on_error: bool = False) -> None:
         """Execute one sync cycle while holding the per-manager lock."""
         if not force and not os.environ.get(_FORCE_SYNC_ENV):
             now = _monotonic()
@@ -248,6 +252,8 @@ class FileSyncManager:
             # leaving the remote with stale files — contradicting this method's
             # documented "next cycle retries everything" contract.
             logger.warning("file_sync: sync failed, rolled back state: %s", exc)
+            if raise_on_error:
+                raise
 
     # ------------------------------------------------------------------
     # Sync-back: pull remote changes to host on teardown

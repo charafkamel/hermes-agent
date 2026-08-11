@@ -1,0 +1,3 @@
+# Hermes does not auto-install repo-plugin dependencies: install into the
+# same interpreter that runs Hermes (`pip install 'compresr>=2.8.4'`).
+compresr>=2.8.4

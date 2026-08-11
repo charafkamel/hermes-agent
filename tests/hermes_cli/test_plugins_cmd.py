@@ -441,7 +441,8 @@ class TestPromptPluginEnvVars:
             ],
         }
 
-        with patch("hermes_cli.config.get_env_value", return_value=None), \
+        with patch("sys.stdin.isatty", return_value=True), \
+             patch("hermes_cli.config.get_env_value", return_value=None), \
              patch("builtins.input", return_value="pk-lf-123"), \
              patch("hermes_cli.config.save_env_value") as mock_save:
             _prompt_plugin_env_vars(manifest, console)
@@ -461,7 +462,8 @@ class TestPromptPluginEnvVars:
             "requires_env": [{"name": "SECRET_KEY", "secret": True}],
         }
 
-        with patch("hermes_cli.config.get_env_value", return_value=None), \
+        with patch("sys.stdin.isatty", return_value=True), \
+             patch("hermes_cli.config.get_env_value", return_value=None), \
              patch("hermes_cli.plugins_cmd.masked_secret_prompt", return_value="s3cret") as mock_prompt, \
              patch("hermes_cli.config.save_env_value"):
             _prompt_plugin_env_vars(manifest, console)

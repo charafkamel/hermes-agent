@@ -179,10 +179,13 @@ def _load_engine_from_dir(engine_dir: Path) -> Optional["ContextEngine"]:
             mod.register(collector)
             if collector.engine:
                 return collector.engine
+            # register() registered nothing: the plugin declined (e.g. missing
+            # credentials) — don't resurrect it via the subclass scan below.
+            return None
         except Exception as e:
             logger.debug("register() failed for %s: %s", name, e)
 
-    # Fallback: find a ContextEngine subclass and instantiate it
+    # Fallback for modules with no register() entry point.
     from agent.context_engine import ContextEngine
     for attr_name in dir(mod):
         attr = getattr(mod, attr_name, None)
