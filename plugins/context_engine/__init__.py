@@ -34,8 +34,8 @@ def discover_context_engines() -> List[Tuple[str, str, bool]]:
     """Scan plugins/context_engine/ for available engines.
 
     Returns list of (name, description, is_available) tuples.
-    Does NOT import the engines — just reads plugin.yaml for metadata
-    and does a lightweight availability check.
+    Imports each engine module to collect its commands and availability;
+    a failing engine is skipped, not fatal.
     """
     results = []
     if not _CONTEXT_ENGINE_PLUGINS_DIR.is_dir():
@@ -179,10 +179,13 @@ def _load_engine_from_dir(engine_dir: Path) -> Optional["ContextEngine"]:
             mod.register(collector)
             if collector.engine:
                 return collector.engine
+            # register() registered nothing: the plugin declined (e.g. missing
+            # credentials) — don't resurrect it via the subclass scan below.
+            return None
         except Exception as e:
             logger.debug("register() failed for %s: %s", name, e)
 
-    # Fallback: find a ContextEngine subclass and instantiate it
+    # Fallback for modules with no register() entry point.
     from agent.context_engine import ContextEngine
     for attr_name in dir(mod):
         attr = getattr(mod, attr_name, None)

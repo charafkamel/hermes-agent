@@ -11735,6 +11735,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         print(f"  Messages:         {msg_count}")
         print(f"  Compressions:     {compressions}")
 
+        from hermes_cli.compresr_usage import (
+            collect_compresr_usage,
+            render_compresr_usage_lines,
+        )
+        for line in render_compresr_usage_lines(
+            collect_compresr_usage(getattr(agent, "context_compressor", None))
+        ):
+            print(f"  {line}")
+
         # Account limits -- fetched off-thread with a hard timeout so slow
         # provider APIs don't hang the prompt.
         provider = getattr(agent, "provider", None) or getattr(self, "provider", None)

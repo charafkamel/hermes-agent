@@ -367,6 +367,12 @@ def _prompt_plugin_env_vars(manifest: dict, console) -> None:
     if not missing:
         return
 
+    if not sys.stdin.isatty():
+        # Scripted/CI enable: don't block on prompts for secrets.
+        names = ", ".join(s["name"] for s in missing)
+        console.print(f"[dim]Set {names} in {display_hermes_home()}/.env to activate.[/dim]")
+        return
+
     plugin_name = manifest.get("name", "this plugin")
     console.print(f"\n[bold]{plugin_name}[/bold] requires the following environment variables:\n")
 
@@ -400,6 +406,44 @@ def _prompt_plugin_env_vars(manifest: dict, console) -> None:
             console.print(f"  [dim]  Skipped (set {name} in {display_hermes_home()}/.env later)[/dim]")
 
     console.print()
+
+
+def _plugin_requires_env(source: str, locator: Optional[str]) -> list:
+    """Best-effort ``requires_env`` for a plugin, for post-enable prompting.
+
+    ``locator`` is the discovery ``dir`` field: a filesystem directory for
+    bundled/user plugins (read its ``plugin.yaml``) or a dotted module path for
+    entrypoint plugins (read a module-level ``REQUIRES_ENV``). Never raises.
+    """
+    if not locator:
+        return []
+    try:
+        if source == "entrypoint":
+            import importlib
+
+            mod = importlib.import_module(locator.split(":", 1)[0])
+            return list(getattr(mod, "REQUIRES_ENV", None) or [])
+        return list(_read_manifest(Path(locator)).get("requires_env") or [])
+    except Exception as e:
+        logger.debug("requires_env lookup failed (%s): %s", locator, e)
+        return []
+
+
+def _prompt_requires_env_for_key(key: str, console) -> None:
+    """Prompt for ``key``'s declared secrets that aren't set yet (saved to
+    ~/.hermes/.env); never blocks enabling on error."""
+    try:
+        source = ""
+        locator = None
+        for _n, _v, _d, src, dpath, k in _discover_all_plugins():
+            if k == key:
+                source, locator = src, dpath
+                break
+        req = _plugin_requires_env(source, locator)
+        if req:
+            _prompt_plugin_env_vars({"name": key, "requires_env": req}, console)
+    except Exception as e:
+        logger.debug("requires_env prompt skipped for %s: %s", key, e)
 
 
 def _display_after_install(plugin_dir: Path, identifier: str) -> None:
@@ -930,6 +974,8 @@ def cmd_enable(name: str, allow_tool_override: Optional[bool] = None) -> None:
     else:
         console.print(f"[dim]Plugin '{key}' is already enabled.[/dim]")
 
+    _prompt_requires_env_for_key(key, console)
+
     # Built-in tool override is a privileged grant. Bundled plugins ship with
     # Hermes core and are trusted; every other source needs operator opt-in.
     if source == "bundled":
@@ -946,6 +992,10 @@ def _resolve_tool_override_grant(
     ``allow_tool_override`` tri-state: True grants, False declines, None
     prompts interactively (defaulting to deny on a non-interactive stdin).
     """
+    if allow_tool_override is None and not sys.stdin.isatty():
+        # Scripted/CI enable: never block on a prompt; deny by default (the
+        # decline branch below prints how to grant it later).
+        allow_tool_override = False
     if allow_tool_override is None:
         # Interactive consent. Default to NO so a blind Enter doesn't grant
         # a privileged capability, and a non-interactive stdin denies safely.
@@ -1773,6 +1823,10 @@ def _run_composite_ui(curses, plugin_keys, plugin_labels, plugin_selected,
             f"\n[green]\u2713[/green] General plugins: {len(new_enabled)} enabled, "
             f"{len(plugin_keys) - len(new_enabled)} disabled."
         )
+        # Prompt for secrets of plugins just switched on.
+        for i in chosen:
+            if i not in plugin_selected and 0 <= i < len(plugin_keys):
+                _prompt_requires_env_for_key(plugin_keys[i], console)
     elif n_plugins > 0:
         console.print("\n[dim]General plugins unchanged.[/dim]")
 
@@ -1836,6 +1890,10 @@ def _run_composite_fallback(plugin_keys, plugin_labels, plugin_selected,
         if new_enabled != prev_enabled or new_disabled != disabled:
             _save_enabled_set(new_enabled)
             _save_disabled_set(new_disabled)
+            # Prompt for secrets of plugins just switched on.
+            for i in chosen:
+                if i not in plugin_selected and 0 <= i < len(plugin_keys):
+                    _prompt_requires_env_for_key(plugin_keys[i], console)
 
     # Provider categories
     if categories:
